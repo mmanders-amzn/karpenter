@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync/atomic"
 
@@ -58,6 +59,22 @@ type NodeClaim struct {
 	//   this expansion.
 	reservedOfferings    cloudprovider.Offerings
 	reservedOfferingMode ReservedOfferingMode
+
+	schedulingOptions     []SchedulingOption
+	locked                bool                          // Boolean to block future pod adds to this NodeClaim
+	nodePoolRequirements  scheduling.Requirements       // original NodePool requirements, immutable
+	nodePoolInstanceTypes []*cloudprovider.InstanceType // original instance types, immutable
+}
+
+type SchedulingOption struct {
+	//	Pods                 []*corev1.Pod
+	PodCount             int
+	InstanceTypes        []*cloudprovider.InstanceType
+	SelectedInstanceType *cloudprovider.InstanceType
+	ResourceRequests     corev1.ResourceList
+	Efficiency           map[string]float64 // cpu, memory efficiency ratios
+	InstanceTypesPrev    []*cloudprovider.InstanceType
+	Requirements         scheduling.Requirements
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -98,14 +115,17 @@ func NewNodeClaim(
 	template.InstanceTypeOptions = instanceTypes
 	template.Spec.Resources.Requests = daemonResources
 	return &NodeClaim{
-		NodeClaimTemplate:    template,
-		hostPortUsage:        hostPortUsage,
-		topology:             topology,
-		daemonResources:      daemonResources,
-		hostname:             hostname,
-		reservedOfferings:    cloudprovider.Offerings{},
-		reservationManager:   reservationManager,
-		reservedOfferingMode: reservedOfferingMode,
+		NodeClaimTemplate:     template,
+		hostPortUsage:         hostPortUsage,
+		topology:              topology,
+		daemonResources:       daemonResources,
+		hostname:              hostname,
+		reservedOfferings:     cloudprovider.Offerings{},
+		reservationManager:    reservationManager,
+		reservedOfferingMode:  reservedOfferingMode,
+		locked:                false,
+		nodePoolRequirements:  scheduling.NewRequirements(nodeClaimTemplate.Requirements.Values()...),
+		nodePoolInstanceTypes: instanceTypes,
 	}
 }
 
@@ -113,6 +133,9 @@ func NewNodeClaim(
 // based on the taints/tolerations, host port compatibility,
 // requirements, resources, reserved capacity reservations, and topology requirements
 func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData, relaxMinValues bool) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, err error) {
+	if n.locked {
+		return nil, nil, nil, fmt.Errorf("nodeclaim is locked for placement")
+	}
 	// Check Taints
 	if err := scheduling.Taints(n.Spec.Taints).ToleratesPod(pod); err != nil {
 		return nil, nil, nil, err
@@ -172,12 +195,95 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	return nodeClaimRequirements, remaining, ofs, nil
 }
 
+func (n *NodeClaim) estimateCheapestPlacement(pods ...*corev1.Pod) (*cloudprovider.InstanceType, float64) {
+	var reqs scheduling.Requirements
+	var totalRequests corev1.ResourceList
+	var instanceTypes []*cloudprovider.InstanceType
+
+	if len(pods) == 0 {
+		pods = n.Pods
+		reqs = n.Requirements
+		totalRequests = n.Spec.Resources.Requests
+		instanceTypes = n.InstanceTypeOptions
+	} else {
+		reqs = scheduling.NewRequirements(n.nodePoolRequirements.Values()...)
+		for _, pod := range pods {
+			reqs.Add(scheduling.NewPodRequirements(pod).Values()...)
+		}
+		totalRequests = resources.Merge(resources.RequestsForPods(pods...), n.daemonResources)
+		instanceTypes = n.nodePoolInstanceTypes
+	}
+
+	var cheapestInstance *cloudprovider.InstanceType
+	var price = math.MaxFloat64
+	for _, it := range instanceTypes {
+		if !compatible(it, reqs) || !resources.Fits(totalRequests, it.Allocatable()) {
+			continue
+		}
+		if p := it.Offerings.Available().WorstLaunchPrice(reqs); p < price {
+			cheapestInstance = it
+			price = p
+		}
+	}
+	return cheapestInstance, price
+}
+
+func (n *NodeClaim) CalculateEfficiency() (*cloudprovider.InstanceType, map[string]float64, float64) {
+	if len(n.Pods) == 0 || len(n.InstanceTypeOptions) == 0 {
+		return nil, nil, 0.0
+	}
+
+	// Find cheapest instance type
+	var cheapestInstance *cloudprovider.InstanceType
+	var lowestPrice = math.MaxFloat64
+
+	for _, it := range n.InstanceTypeOptions {
+		price := it.Offerings.Available().WorstLaunchPrice(n.Requirements)
+		if cheapestInstance == nil || price < lowestPrice {
+			cheapestInstance = it
+			lowestPrice = price
+		}
+	}
+
+	if cheapestInstance == nil {
+		return nil, nil, 0.0
+	}
+
+	// Calculate efficiency using accumulated requests
+	allocatable := cheapestInstance.Allocatable()
+	requests := n.Spec.Resources.Requests
+
+	cpuReq := requests[corev1.ResourceCPU]
+	memReq := requests[corev1.ResourceMemory]
+	cpuAlloc := allocatable[corev1.ResourceCPU]
+	memAlloc := allocatable[corev1.ResourceMemory]
+
+	// Calculate weighted efficiency using cpu_cores * 1 + mem_gib * (1/9)
+	// We don't want to hardcode these weights throughout, fix.
+	cpuCores := float64(cpuReq.MilliValue()) / 1000
+	memGiB := float64(memReq.Value()) / (1024 * 1024 * 1024)
+	podWeightedValue := cpuCores*1 + memGiB*(1.0/9.0)
+
+	instanceCpuCores := float64(cpuAlloc.MilliValue()) / 1000
+	instanceMemGiB := float64(memAlloc.Value()) / (1024 * 1024 * 1024)
+	instanceWeightedValue := instanceCpuCores*1 + instanceMemGiB*(1.0/9.0)
+
+	efficiency := map[string]float64{
+		"cpu":      cpuCores / instanceCpuCores,
+		"memory":   memGiB / instanceMemGiB,
+		"weighted": podWeightedValue / instanceWeightedValue,
+	}
+
+	return cheapestInstance, efficiency, lowestPrice
+}
+
 // Add updates the NodeClaim to schedule the pod to this NodeClaim, updating
 // the NodeClaim with new requirements, instance types, and offerings to reserve
 // based on the pod scheduling
 func (n *NodeClaim) Add(pod *corev1.Pod, podData *PodData, nodeClaimRequirements scheduling.Requirements, instanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering) {
 	// Update node
 	n.Pods = append(n.Pods, pod)
+	instanceTypesPrev := n.InstanceTypeOptions
 	n.InstanceTypeOptions = instanceTypes
 	n.Spec.Resources.Requests = resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 	n.Requirements = nodeClaimRequirements
@@ -187,6 +293,26 @@ func (n *NodeClaim) Add(pod *corev1.Pod, podData *PodData, nodeClaimRequirements
 	n.reservationManager.Reserve(n.hostname, offeringsToReserve...)
 	n.releaseReservedOfferings(n.reservedOfferings, offeringsToReserve)
 	n.reservedOfferings = offeringsToReserve
+
+	// Capture current state as an option
+	instanceType, efficiency, _ := n.CalculateEfficiency()
+
+	// Make a copy of the current resource requests
+	resourcesCopy := corev1.ResourceList{}
+	for k, v := range n.Spec.Resources.Requests {
+		resourcesCopy[k] = v.DeepCopy()
+	}
+
+	option := SchedulingOption{
+		PodCount:             len(n.Pods),
+		InstanceTypes:        instanceTypes,
+		SelectedInstanceType: instanceType,
+		ResourceRequests:     resourcesCopy, // Store current total
+		Efficiency:           efficiency,
+		InstanceTypesPrev:    instanceTypesPrev,
+		Requirements:         nodeClaimRequirements,
+	}
+	n.schedulingOptions = append(n.schedulingOptions, option)
 }
 
 // releaseReservedOfferings releases all offerings which are present in the current reserved offerings, but are not
@@ -456,6 +582,10 @@ func compatible(instanceType *cloudprovider.InstanceType, requirements schedulin
 
 func fits(instanceType *cloudprovider.InstanceType, requests corev1.ResourceList) bool {
 	return resources.Fits(requests, instanceType.Allocatable())
+}
+
+func (n *NodeClaim) Hostname() string {
+	return n.hostname
 }
 
 // addVolumeRequirements adds volume topology requirements to nodeRequirements after checking compatibility.

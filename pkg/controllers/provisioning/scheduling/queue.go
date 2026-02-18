@@ -35,7 +35,7 @@ type Queue struct {
 
 // NewQueue constructs a new queue given the input pods, sorting them to optimize for bin-packing into nodes.
 func NewQueue(pods []*v1.Pod, podData map[types.UID]*PodData) *Queue {
-	sort.Slice(pods, byCPUAndMemoryDescending(pods, podData))
+	sort.Slice(pods, byCPUAndMemoryWeightDescending(pods, podData))
 	return &Queue{
 		pods:    pods,
 		lastLen: map[types.UID]int{},
@@ -89,6 +89,48 @@ func byCPUAndMemoryDescending(pods []*v1.Pod, podData map[types.UID]*PodData) fu
 		if memCmp < 0 {
 			return false
 		} else if memCmp > 0 {
+			return true
+		}
+
+		// If all else is equal, give a consistent ordering. This reduces the number of NominatePod events as we
+		// de-duplicate those based on identical content.
+
+		// unfortunately creation timestamp only has a 1-second resolution, so we would still re-order pods created
+		// during a deployment scale-up if we only looked at creation time
+		if lhsPod.CreationTimestamp != rhsPod.CreationTimestamp {
+			return lhsPod.CreationTimestamp.Before(&rhsPod.CreationTimestamp)
+		}
+
+		// pod UIDs aren't in any order, but since we first sort by creation time this only serves to consistently order
+		// pods created within the same second
+		return lhsPod.UID < rhsPod.UID
+	}
+}
+
+func byCPUAndMemoryWeightDescending(pods []*v1.Pod, podData map[types.UID]*PodData) func(i int, j int) bool {
+	return func(i, j int) bool {
+		lhsPod := pods[i]
+		rhsPod := pods[j]
+
+		lhs := podData[lhsPod.UID].Requests
+		rhs := podData[rhsPod.UID].Requests
+
+		lhsCPU := lhs[v1.ResourceCPU]
+		lhsMem := lhs[v1.ResourceMemory]
+		lhsCPUCores := float64(lhsCPU.MilliValue()) / 1000
+		lhsMemGiB := float64(lhsMem.Value()) / (1024 * 1024 * 1024)
+		lhsWeight := lhsCPUCores*1 + lhsMemGiB*(1/9.0)
+
+		rhsCPU := rhs[v1.ResourceCPU]
+		rhsMem := rhs[v1.ResourceMemory]
+		rhsCPUCores := float64(rhsCPU.MilliValue()) / 1000
+		rhsMemGiB := float64(rhsMem.Value()) / (1024 * 1024 * 1024)
+		rhsWeight := rhsCPUCores*1 + rhsMemGiB*(1/9.0)
+
+		if lhsWeight < rhsWeight {
+			// LHS has less weighted resources, so it should be sorted after
+			return false
+		} else if lhsWeight > rhsWeight {
 			return true
 		}
 
