@@ -178,6 +178,7 @@ func NewScheduler(
 		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		OptimizeNodeClaim:       true,
 	}
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods)
 	return s
@@ -212,6 +213,7 @@ type Scheduler struct {
 	preferencePolicy        PreferencePolicy
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
+	OptimizeNodeClaim       bool
 }
 
 // DRAError indicates a pod will not be attempted to be scheduled because it has Dynamic Resource Allocation requirements
@@ -378,6 +380,62 @@ func (r Results) TruncateInstanceTypes(ctx context.Context, maxInstanceTypes int
 	return r
 }
 
+// REVIEW - Alt version, simplified.
+func (s *Scheduler) optimizeNodeClaimsForEfficiency(ctx context.Context, q *Queue, podErrors map[*corev1.Pod]error) {
+	for _, nc := range s.newNodeClaims {
+		if nc.locked || len(nc.schedulingOptions) == 0 {
+			continue
+		}
+		nc.locked = true
+
+		curr := &nc.schedulingOptions[len(nc.schedulingOptions)-1]
+		if curr.SelectedInstanceType == nil {
+			continue
+		}
+
+		currCores := curr.SelectedInstanceType.Capacity.Cpu().AsApproximateFloat64()
+
+		// Find the most recent smaller option
+		var smaller *SchedulingOption
+		for i := len(nc.schedulingOptions) - 2; i >= 0; i-- {
+			opt := &nc.schedulingOptions[i]
+			optCores := opt.SelectedInstanceType.Capacity.Cpu().AsApproximateFloat64()
+			if opt.SelectedInstanceType != nil && optCores < currCores {
+				smaller = opt
+				break
+			}
+		}
+
+		// If no smaller instance is found, or efficiency gain is less than .05, skip
+		if smaller == nil || smaller.Efficiency["weighted"] <= curr.Efficiency["weighted"]+.05 {
+			continue
+		}
+
+		// Cost check: only downsize if splitting is cheaper
+		displacedPods := nc.Pods[smaller.PodCount:]
+
+		smallerPrice := smaller.SelectedInstanceType.Offerings.Available().WorstLaunchPrice(smaller.Requirements)
+		_, displacedPrice := nc.estimateCheapestPlacement(displacedPods...)
+		_, currentPrice := nc.estimateCheapestPlacement()
+
+		if smallerPrice+displacedPrice > currentPrice {
+			continue
+		}
+
+		// Apply the downsize
+		nc.Pods = nc.Pods[:smaller.PodCount]
+		nc.InstanceTypeOptions = smaller.InstanceTypes
+		nc.Spec.Resources.Requests = smaller.ResourceRequests
+		nc.Requirements = smaller.Requirements
+		for _, pod := range displacedPods {
+			podErrors[pod] = fmt.Errorf("pod displaced due to efficiency optimization")
+			s.updateCachedPodData(pod)
+			q.Push(pod)
+		}
+	}
+}
+
+//nolint:gocyclo
 func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, error) {
 	defer metrics.Measure(DurationSeconds, map[string]string{ControllerLabel: injection.GetControllerName(ctx)})()
 	// We loop trying to schedule unschedulable pods as long as we are making progress.  This solves a few
@@ -395,15 +453,23 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 	q := NewQueue(pods, s.cachedPodData)
 
 	startTime := s.clock.Now()
+	nodeClaimRetries := 0
 	for {
 		UnfinishedWorkSeconds.Set(s.clock.Since(startTime).Seconds(), map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
 		QueueDepth.Set(float64(len(q.pods)), map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
 
 		// Try the next pod
 		pod, ok := q.Pop()
+		if !ok && s.OptimizeNodeClaim && nodeClaimRetries < 3 {
+			nodeClaimRetries++
+			s.optimizeNodeClaimsForEfficiency(ctx, q, podErrors)
+			q = NewQueue(q.List(), s.cachedPodData)
+			pod, ok = q.Pop()
+		}
 		if !ok {
 			break
 		}
+
 		// We relax the pod all the way the first time we see it
 		// If we don't schedule it, we store the original pod (with preferences)
 		// in the queue and give ourselves another chance to schedule it later

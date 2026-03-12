@@ -19,9 +19,12 @@ package scheduling_test
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
+	appsv1 "k8s.io/api/apps/v1"
 	"math"
 	"math/rand"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +40,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -44,9 +48,11 @@ import (
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	"k8s.io/csi-translation-lib/plugins"
 	clock "k8s.io/utils/clock/testing"
+	"pgregory.net/rapid"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeClient "sigs.k8s.io/controller-runtime/pkg/client/fake"
-
+	kwok "sigs.k8s.io/karpenter/kwok/cloudprovider"
+	kwokoptions "sigs.k8s.io/karpenter/kwok/options"
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -4980,6 +4986,355 @@ var _ = Context("Scheduling", func() {
 			// Verify that when DRA is ignored, less CPU is allocated (smaller instance selected) than when DRA is counted
 			Expect(allocatedCPU1.Cmp(allocatedCPU2)).To(BeNumerically("<", 0))
 		})
+	})
+
+	Describe("NodeClaim Optimization Main", func() {
+		It("should compare optimization", func() {
+			fmt.Println("\n\n=== STARTING NodeClaim Optimization Test ===")
+			csvWriter, err := NewCSVWriter()
+			Expect(err).ToNot(HaveOccurred())
+			defer csvWriter.Close()
+
+			createNodePool := func() *v1.NodePool {
+				return test.NodePool(v1.NodePool{
+					Spec: v1.NodePoolSpec{
+						Limits: v1.Limits(corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1000000"),
+						}),
+					},
+				})
+			}
+
+			runIndex := 0
+			rapid.Check(GinkgoT(), func(t *rapid.T) {
+				runIndex++
+
+				// Clean up from previous run
+				ExpectCleanedUp(ctx, env.Client)
+				cluster.Reset()
+				scheduling.QueueDepth.Reset()
+				scheduling.DurationSeconds.Reset()
+				scheduling.UnschedulablePodsCount.Reset()
+
+				ctx = kwokoptions.ToContext(ctx, &kwokoptions.Options{})
+				instanceTypes, err := kwok.ConstructInstanceTypes(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				cloudProvider.InstanceTypes = instanceTypes
+
+				podCount := rapid.IntRange(1, 1000).Draw(t, "podCount")
+
+				pods := make([]*corev1.Pod, podCount)
+				for i := 0; i < podCount; i++ {
+					cpuFloat := rapid.Float64Range(0.25, 8.0).Draw(t, "cpuRequest")
+					memFloatMultiplier := rapid.Float64Range(.25, 16).Draw(t, "memRequest")
+					memFloat := cpuFloat * memFloatMultiplier
+					pods[i] = test.UnschedulablePod(test.PodOptions{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      fmt.Sprintf("pod-%d", i),
+							Namespace: "default",
+							UID:       types.UID(fmt.Sprintf("pod-%d", i)),
+						},
+						Image: "nginx:latest",
+						ResourceRequirements: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%.2f", cpuFloat)),
+								corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%.2fGi", memFloat)),
+							},
+						},
+					})
+				}
+
+				totalCPU := resource.Quantity{}
+				totalMem := resource.Quantity{}
+				for _, pod := range pods {
+					for _, c := range pod.Spec.Containers {
+						totalCPU.Add(*c.Resources.Requests.Cpu())
+						totalMem.Add(*c.Resources.Requests.Memory())
+					}
+				}
+
+				fmt.Printf("Generated %d pods: total_cpu=%.2f total_mem=%.2f\n",
+					len(pods),
+					float64(totalCPU.MilliValue())/1000.0,
+					float64(totalMem.Value())/(1024*1024*1024),
+				)
+
+				// Without optimization
+				nodePool := createNodePool()
+				ExpectApplied(ctx, env.Client, nodePool)
+
+				pods1 := make([]*corev1.Pod, len(pods))
+				for i, p := range pods {
+					pods1[i] = p.DeepCopy()
+				}
+
+				start1 := time.Now()
+				s1, _ := prov.NewScheduler(ctx, pods1, nil)
+				s1.OptimizeNodeClaim = false
+				results1, _ := s1.Solve(ctx, pods1)
+				duration1 := time.Since(start1)
+
+				cost1 := calculateCost(results1.NewNodeClaims)
+
+				// With optimization
+				ExpectCleanedUp(ctx, env.Client)
+				cluster.Reset()
+
+				nodePool = createNodePool()
+				ExpectApplied(ctx, env.Client, nodePool)
+
+				pods2 := make([]*corev1.Pod, len(pods))
+				for i, p := range pods {
+					pods2[i] = p.DeepCopy()
+				}
+				start2 := time.Now()
+				s2, _ := prov.NewScheduler(ctx, pods2, nil)
+				s2.OptimizeNodeClaim = true
+				results2, _ := s2.Solve(ctx, pods2)
+				duration2 := time.Since(start2)
+
+				cost2 := calculateCost(results2.NewNodeClaims)
+
+				fmt.Printf("run (%d), pods (%d), without_nc (%d), with_nc (%d), without_cost (%.4f), with_cost (%.4f)\n",
+					runIndex, podCount, len(results1.NewNodeClaims), len(results2.NewNodeClaims), cost1, cost2)
+
+				csvWriter.WriteSummary(runIndex, podCount, len(results1.NewNodeClaims), len(results2.NewNodeClaims), cost1, cost2, duration1.Seconds(), duration2.Seconds())
+				csvWriter.WriteNodeClaims(runIndex, "s1", results1.NewNodeClaims)
+				csvWriter.WriteNodeClaims(runIndex, "s2", results2.NewNodeClaims)
+
+				Expect(cost2).To(BeNumerically("<=", cost1+.00001), "optimized cost (%.4f) should be <= unoptimized cost (%.4f)", cost2, cost1)
+
+				ExpectCleanedUp(ctx, env.Client)
+				cluster.Reset()
+			})
+		})
+	})
+
+	Describe("NodeClaim Optimization with DaemonSets", func() {
+		It("should compare optimization", func() {
+			fmt.Println("\n\n=== STARTING NodeClaim Optimization Test ===")
+			csvWriter, err := NewCSVWriter()
+			Expect(err).ToNot(HaveOccurred())
+			defer csvWriter.Close()
+
+			createNodePool := func() *v1.NodePool {
+				return test.NodePool(v1.NodePool{
+					Spec: v1.NodePoolSpec{
+						Limits: v1.Limits(corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1000000"),
+						}),
+					},
+				})
+			}
+
+			createDaemonSet := func(cpu, mem string) *appsv1.DaemonSet {
+				return test.DaemonSet(
+					test.DaemonSetOptions{PodOptions: test.PodOptions{
+						ResourceRequirements: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(cpu),
+								corev1.ResourceMemory: resource.MustParse(mem),
+							},
+						},
+					}},
+				)
+			}
+
+			runIndex := 0
+			rapid.Check(GinkgoT(), func(t *rapid.T) {
+				runIndex++
+
+				// Clean up from previous run
+				ExpectCleanedUp(ctx, env.Client)
+				cluster.Reset()
+				scheduling.QueueDepth.Reset()
+				scheduling.DurationSeconds.Reset()
+				scheduling.UnschedulablePodsCount.Reset()
+
+				ctx = kwokoptions.ToContext(ctx, &kwokoptions.Options{})
+				instanceTypes, err := kwok.ConstructInstanceTypes(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				cloudProvider.InstanceTypes = instanceTypes
+
+				podCount := rapid.IntRange(1, 1000).Draw(t, "podCount")
+
+				pods := make([]*corev1.Pod, podCount)
+				for i := 0; i < podCount; i++ {
+					cpuFloat := rapid.Float64Range(0.25, 8.0).Draw(t, "cpuRequest")
+					memFloatMultiplier := rapid.Float64Range(.25, 16).Draw(t, "memRequest")
+					memFloat := cpuFloat * memFloatMultiplier
+					pods[i] = test.UnschedulablePod(test.PodOptions{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      fmt.Sprintf("pod-%d", i),
+							Namespace: "default",
+							UID:       types.UID(fmt.Sprintf("pod-%d", i)),
+						},
+						Image: "nginx:latest",
+						ResourceRequirements: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%dm", int(cpuFloat*1000))),
+								corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dMi", int(memFloat*1024))),
+							},
+						},
+					})
+				}
+
+				dsCpuFloat := rapid.Float64Range(0.25, 8.0).Draw(t, "dsCpuRequest")
+				dsMemFloatMultiplier := rapid.Float64Range(1, 4).Draw(t, "dsMemRequest")
+				dsMemFloat := dsCpuFloat * dsMemFloatMultiplier
+
+				totalCPU := resource.Quantity{}
+				totalMem := resource.Quantity{}
+				for _, pod := range pods {
+					for _, c := range pod.Spec.Containers {
+						totalCPU.Add(*c.Resources.Requests.Cpu())
+						totalMem.Add(*c.Resources.Requests.Memory())
+					}
+				}
+
+				fmt.Printf("Generated %d pods: total_cpu=%.2f total_mem=%.2f ds_cpu=%.2f ds_mem=%.2fGi\n",
+					len(pods),
+					float64(totalCPU.MilliValue())/1000.0,
+					float64(totalMem.Value())/(1024*1024*1024),
+					dsCpuFloat,
+					dsMemFloat,
+				)
+				// Without optimization
+				nodePool := createNodePool()
+				ExpectApplied(ctx, env.Client, nodePool)
+				daemonSet := createDaemonSet(fmt.Sprintf("%dm", int(dsCpuFloat*1000)), fmt.Sprintf("%dMi", int(dsMemFloat*1024)))
+				ExpectApplied(ctx, env.Client, daemonSet)
+
+				pods1 := make([]*corev1.Pod, len(pods))
+				for i, p := range pods {
+					pods1[i] = p.DeepCopy()
+				}
+
+				start1 := time.Now()
+				s1, _ := prov.NewScheduler(ctx, pods1, nil)
+				s1.OptimizeNodeClaim = false
+				results1, _ := s1.Solve(ctx, pods1)
+				duration1 := time.Since(start1)
+
+				cost1 := calculateCost(results1.NewNodeClaims)
+
+				// With optimization
+				ExpectCleanedUp(ctx, env.Client)
+				cluster.Reset()
+
+				nodePool = createNodePool()
+				ExpectApplied(ctx, env.Client, nodePool)
+				daemonSet = createDaemonSet(fmt.Sprintf("%dm", int(dsCpuFloat*1000)), fmt.Sprintf("%dMi", int(dsMemFloat*1024)))
+				ExpectApplied(ctx, env.Client, daemonSet)
+
+				pods2 := make([]*corev1.Pod, len(pods))
+				for i, p := range pods {
+					pods2[i] = p.DeepCopy()
+				}
+				start2 := time.Now()
+				s2, _ := prov.NewScheduler(ctx, pods2, nil)
+				s2.OptimizeNodeClaim = true
+				results2, _ := s2.Solve(ctx, pods2)
+				duration2 := time.Since(start2)
+
+				cost2 := calculateCost(results2.NewNodeClaims)
+
+				fmt.Printf("run (%d), pods (%d), without_nc (%d), with_nc (%d), without_cost (%.4f), with_cost (%.4f)\n",
+					runIndex, podCount, len(results1.NewNodeClaims), len(results2.NewNodeClaims), cost1, cost2)
+
+				csvWriter.WriteSummary(runIndex, podCount, len(results1.NewNodeClaims), len(results2.NewNodeClaims), cost1, cost2, duration1.Seconds(), duration2.Seconds())
+				csvWriter.WriteNodeClaims(runIndex, "s1", results1.NewNodeClaims)
+				csvWriter.WriteNodeClaims(runIndex, "s2", results2.NewNodeClaims)
+
+				Expect(cost2).To(BeNumerically("<=", cost1+.00001), "optimized cost (%.4f) should be <= unoptimized cost (%.4f)", cost2, cost1)
+
+				ExpectCleanedUp(ctx, env.Client)
+				cluster.Reset()
+			})
+		})
+	})
+
+	XContext("NodeClaim Optimization Deterministic", func() {
+		It("should schedule pods deterministically from CSV", func() {
+			rapid.Check(GinkgoT(), func(t *rapid.T) {
+				// Read pods from CSV file
+				file, err := os.Open("nodeclaim_optimization_test_pods.csv")
+				Expect(err).ToNot(HaveOccurred())
+				defer file.Close()
+
+				reader := csv.NewReader(file)
+				records, err := reader.ReadAll()
+				Expect(err).ToNot(HaveOccurred())
+
+				// Skip header row
+				var pods []*corev1.Pod
+				for i, record := range records {
+					if i == 0 {
+						continue // Skip header
+					}
+					// Assuming CSV format: pod_name,cpu,memory
+					podName := record[0]
+					cpuStr := record[1]
+					memStr := record[2]
+
+					pods = append(pods, test.UnschedulablePod(test.PodOptions{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      podName,
+							Namespace: "default",
+							UID:       types.UID(podName),
+						},
+						Image: "nginx:latest",
+						ResourceRequirements: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(cpuStr),
+								corev1.ResourceMemory: resource.MustParse(memStr + "Gi"),
+							},
+						},
+					}))
+				}
+
+				// Clean up
+				ExpectCleanedUp(ctx, env.Client)
+				cluster.Reset()
+				scheduling.QueueDepth.Reset()
+				scheduling.DurationSeconds.Reset()
+				scheduling.UnschedulablePodsCount.Reset()
+
+				// Setup instance types
+				ctx = kwokoptions.ToContext(ctx, &kwokoptions.Options{})
+				instanceTypes, err := kwok.ConstructInstanceTypes(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				cloudProvider.InstanceTypes = instanceTypes
+
+				// Create NodePool
+				nodePool := test.NodePool(v1.NodePool{
+					Spec: v1.NodePoolSpec{
+						Limits: v1.Limits(corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1000000"),
+						}),
+					},
+				})
+				ExpectApplied(ctx, env.Client, nodePool)
+
+				// Run scheduling
+				scheduler, err := prov.NewScheduler(ctx, pods, nil)
+				scheduler.OptimizeNodeClaim = false
+				Expect(err).ToNot(HaveOccurred())
+				results, err := scheduler.Solve(ctx, pods)
+				Expect(err).ToNot(HaveOccurred())
+
+				fmt.Printf("Scheduled %d pods across %d nodeclaims\n", len(pods), len(results.NewNodeClaims))
+				for i, nc := range results.NewNodeClaims {
+					_, _, price := nc.CalculateEfficiency()
+					fmt.Printf("NodeClaim %d, %s: %d pods, $%.4f\n",
+						i,
+						nc.Hostname(),
+						len(nc.Pods),
+						price,
+					)
+				}
+			})
+		}) // Close rapid.Check
 	})
 })
 
