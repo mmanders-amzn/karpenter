@@ -33,9 +33,12 @@ type Queue struct {
 	lastLen map[types.UID]int
 }
 
+// PodComparator defines a sort strategy for pod scheduling order.
+type PodComparator func(pods []*v1.Pod, podData map[types.UID]*PodData) func(i, j int) bool
+
 // NewQueue constructs a new queue given the input pods, sorting them to optimize for bin-packing into nodes.
-func NewQueue(pods []*v1.Pod, podData map[types.UID]*PodData) *Queue {
-	sort.Slice(pods, byCPUAndMemoryDescending(pods, podData))
+func NewQueue(pods []*v1.Pod, podData map[types.UID]*PodData, cmp PodComparator) *Queue {
+	sort.Slice(pods, cmp(pods, podData))
 	return &Queue{
 		pods:    pods,
 		lastLen: map[types.UID]int{},
@@ -103,6 +106,36 @@ func byCPUAndMemoryDescending(pods []*v1.Pod, podData map[types.UID]*PodData) fu
 
 		// pod UIDs aren't in any order, but since we first sort by creation time this only serves to consistently order
 		// pods created within the same second
+		return lhsPod.UID < rhsPod.UID
+	}
+}
+
+func byCPUAndMemoryWeightDescending(pods []*v1.Pod, podData map[types.UID]*PodData) func(i int, j int) bool {
+	return func(i, j int) bool {
+		lhsPod := pods[i]
+		rhsPod := pods[j]
+
+		lhs := podData[lhsPod.UID].Requests
+		rhs := podData[rhsPod.UID].Requests
+
+		lhsWeight := WeightedResourceValue(
+			float64(lhs.Cpu().MilliValue())/1000,
+			float64(lhs.Memory().Value())/(1<<30), // bytes to GiB
+		)
+		rhsWeight := WeightedResourceValue(
+			float64(rhs.Cpu().MilliValue())/1000,
+			float64(rhs.Memory().Value())/(1<<30), // bytes to GiB
+		)
+
+		// Greatest cost-weighted resource value first
+		if lhsWeight != rhsWeight {
+			return lhsWeight > rhsWeight
+		}
+		// Earlier creation time first, to reduce NominatePod event churn
+		if lhsPod.CreationTimestamp != rhsPod.CreationTimestamp {
+			return lhsPod.CreationTimestamp.Before(&rhsPod.CreationTimestamp)
+		}
+		// Tie-break by UID
 		return lhsPod.UID < rhsPod.UID
 	}
 }

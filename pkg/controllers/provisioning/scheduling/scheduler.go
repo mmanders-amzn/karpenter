@@ -89,6 +89,7 @@ type options struct {
 	preferencePolicy        PreferencePolicy
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
+	optimizeNodeClaim       bool
 }
 
 type Options = option.Function[options]
@@ -111,6 +112,10 @@ var MinValuesPolicy = func(policy karpopts.MinValuesPolicy) func(*options) {
 	return func(opts *options) {
 		opts.minValuesPolicy = policy
 	}
+}
+
+var EnableNodeClaimOptimization = func(opts *options) {
+	opts.optimizeNodeClaim = true
 }
 
 func NewScheduler(
@@ -178,6 +183,7 @@ func NewScheduler(
 		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		OptimizeNodeClaim:       option.Resolve(opts...).optimizeNodeClaim,
 	}
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods)
 	return s
@@ -212,6 +218,7 @@ type Scheduler struct {
 	preferencePolicy        PreferencePolicy
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
+	OptimizeNodeClaim       bool
 }
 
 // DRAError indicates a pod will not be attempted to be scheduled because it has Dynamic Resource Allocation requirements
@@ -392,9 +399,10 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 	for _, p := range pods {
 		s.updateCachedPodData(p)
 	}
-	q := NewQueue(pods, s.cachedPodData)
+	q := NewQueue(pods, s.cachedPodData, byCPUAndMemoryWeightDescending)
 
 	startTime := s.clock.Now()
+	optimizationPasses := 0
 	for {
 		UnfinishedWorkSeconds.Set(s.clock.Since(startTime).Seconds(), map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
 		QueueDepth.Set(float64(len(q.pods)), map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
@@ -402,6 +410,10 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		// Try the next pod
 		pod, ok := q.Pop()
 		if !ok {
+			if s.OptimizeNodeClaim && optimizationPasses < 1 && s.optimizeNodeClaims(q) {
+				optimizationPasses++
+				continue
+			}
 			break
 		}
 		// We relax the pod all the way the first time we see it
