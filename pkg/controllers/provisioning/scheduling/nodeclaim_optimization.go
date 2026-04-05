@@ -34,13 +34,19 @@ const (
 	// minEfficiencyGain is the minimum weighted efficiency improvement an earlier
 	// scheduling state must have over the current state to qualify as a split candidate.
 	minEfficiencyGain = 0.10
+	// memoryGiBToCPURatio is the number of GiB of memory equivalent in cost to
+	// 1 vCPU, derived from AWS general-purpose instance family pricing.
+	memoryGiBToCPURatio = 9.0
+	// maxOptimizationPasses is the number of optimization passes to run before
+	// exiting the scheduling loop.
+	maxOptimizationPasses = 1
 )
 
 // WeightedResourceValue computes a single scalar representing the cost-weighted
 // resource footprint. The ratio (1 vCPU ≈ 9× the cost-weight of 1 GiB memory)
 // is derived from AWS general-purpose instance family pricing.
 func WeightedResourceValue(cpuCores, memGiB float64) float64 {
-	return cpuCores + memGiB/9.0
+	return cpuCores + memGiB/memoryGiBToCPURatio
 }
 
 // ResourceEfficiencyResult holds utilization ratios for a set of resource

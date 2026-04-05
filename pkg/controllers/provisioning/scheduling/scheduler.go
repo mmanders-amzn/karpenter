@@ -410,7 +410,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		// Try the next pod
 		pod, ok := q.Pop()
 		if !ok {
-			if s.OptimizeNodeClaim && optimizationPasses < 1 && s.optimizeNodeClaims(q) {
+			if s.OptimizeNodeClaim && optimizationPasses < maxOptimizationPasses && s.optimizeNodeClaims(q) {
 				optimizationPasses++
 				continue
 			}
