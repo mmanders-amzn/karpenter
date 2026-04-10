@@ -58,6 +58,11 @@ type NodeClaim struct {
 	//   this expansion.
 	reservedOfferings    cloudprovider.Offerings
 	reservedOfferingMode ReservedOfferingMode
+
+	schedulingOptions     []SchedulingOption
+	nodePoolRequirements  scheduling.Requirements        // original NodePool requirements, immutable
+	nodePoolInstanceTypes []*cloudprovider.InstanceType   // original instance types, immutable
+	locked                bool                            // prevents pod adds and re-optimization after split
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -98,14 +103,16 @@ func NewNodeClaim(
 	template.InstanceTypeOptions = instanceTypes
 	template.Spec.Resources.Requests = daemonResources
 	return &NodeClaim{
-		NodeClaimTemplate:    template,
-		hostPortUsage:        hostPortUsage,
-		topology:             topology,
-		daemonResources:      daemonResources,
-		hostname:             hostname,
-		reservedOfferings:    cloudprovider.Offerings{},
-		reservationManager:   reservationManager,
-		reservedOfferingMode: reservedOfferingMode,
+		NodeClaimTemplate:     template,
+		hostPortUsage:         hostPortUsage,
+		topology:              topology,
+		daemonResources:       daemonResources,
+		hostname:              hostname,
+		reservedOfferings:     cloudprovider.Offerings{},
+		reservationManager:    reservationManager,
+		reservedOfferingMode:  reservedOfferingMode,
+		nodePoolRequirements:  scheduling.NewRequirements(nodeClaimTemplate.Requirements.Values()...),
+		nodePoolInstanceTypes: instanceTypes,
 	}
 }
 
@@ -113,6 +120,9 @@ func NewNodeClaim(
 // based on the taints/tolerations, host port compatibility,
 // requirements, resources, reserved capacity reservations, and topology requirements
 func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData, relaxMinValues bool) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, err error) {
+	if n.locked {
+		return nil, nil, nil, fmt.Errorf("nodeclaim is locked for optimization")
+	}
 	// Check Taints
 	if err := scheduling.Taints(n.Spec.Taints).ToleratesPod(pod); err != nil {
 		return nil, nil, nil, err
@@ -187,6 +197,24 @@ func (n *NodeClaim) Add(pod *corev1.Pod, podData *PodData, nodeClaimRequirements
 	n.reservationManager.Reserve(n.hostname, offeringsToReserve...)
 	n.releaseReservedOfferings(n.reservedOfferings, offeringsToReserve)
 	n.reservedOfferings = offeringsToReserve
+
+	// Snapshot current state for optimization pass. Only store one entry per
+	// cheapest instance type: replace if same type, append if new.
+	if best, price := cheapestFit(instanceTypes, nodeClaimRequirements, n.Spec.Resources.Requests); best != nil {
+		opt := SchedulingOption{
+			PodCount:         len(n.Pods),
+			InstanceTypes:    instanceTypes,
+			Requirements:     nodeClaimRequirements,
+			ResourceRequests: n.Spec.Resources.Requests.DeepCopy(),
+			CheapestInstance: best,
+			Price:            price,
+		}
+		if last := len(n.schedulingOptions) - 1; last >= 0 && n.schedulingOptions[last].CheapestInstance.Name == best.Name {
+			n.schedulingOptions[last] = opt
+		} else {
+			n.schedulingOptions = append(n.schedulingOptions, opt)
+		}
+	}
 }
 
 // releaseReservedOfferings releases all offerings which are present in the current reserved offerings, but are not
