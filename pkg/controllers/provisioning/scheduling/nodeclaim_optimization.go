@@ -30,7 +30,7 @@ import (
 const (
 	// minPriceSavingsRatio is the minimum price reduction (relative to current
 	// price) an earlier scheduling state must offer to be considered a split candidate.
-	minPriceSavingsRatio = 0.30
+	minPriceSavingsRatio = 0.24
 	// minEfficiencyGain is the minimum weighted efficiency improvement an earlier
 	// scheduling state must have over the current state to qualify as a split candidate.
 	minEfficiencyGain = 0.10
@@ -39,7 +39,7 @@ const (
 	memoryGiBToCPURatio = 9.0
 	// maxOptimizationPasses is the number of optimization passes to run before
 	// exiting the scheduling loop.
-	maxOptimizationPasses = 1
+	maxOptimizationPasses = 2
 )
 
 // WeightedResourceValue computes a single scalar representing the cost-weighted
