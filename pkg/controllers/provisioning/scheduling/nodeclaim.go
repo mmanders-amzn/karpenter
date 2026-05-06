@@ -58,6 +58,8 @@ type NodeClaim struct {
 	//   this expansion.
 	reservedOfferings    cloudprovider.Offerings
 	reservedOfferingMode ReservedOfferingMode
+
+	optimizationState // optimization pass state (see nodeclaim_optimization.go)
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -89,6 +91,7 @@ func NewNodeClaim(
 	instanceTypes []*cloudprovider.InstanceType,
 	reservationManager *ReservationManager,
 	reservedOfferingMode ReservedOfferingMode,
+	optimizeEnabled bool,
 ) *NodeClaim {
 	hostname := fmt.Sprintf("hostname-placeholder-%04d", atomic.AddInt64(&nodeID, 1))
 	template := *nodeClaimTemplate
@@ -106,6 +109,7 @@ func NewNodeClaim(
 		reservedOfferings:    cloudprovider.Offerings{},
 		reservationManager:   reservationManager,
 		reservedOfferingMode: reservedOfferingMode,
+		optimizationState:    newOptimizationState(optimizeEnabled, nodeClaimTemplate.Requirements, instanceTypes),
 	}
 }
 
@@ -113,6 +117,9 @@ func NewNodeClaim(
 // based on the taints/tolerations, host port compatibility,
 // requirements, resources, reserved capacity reservations, and topology requirements
 func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData, relaxMinValues bool) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, err error) {
+	if n.optimizationState.locked {
+		return nil, nil, nil, fmt.Errorf("nodeclaim is locked for optimization")
+	}
 	// Check Taints
 	if err := scheduling.Taints(n.Spec.Taints).ToleratesPod(pod); err != nil {
 		return nil, nil, nil, err
@@ -182,11 +189,13 @@ func (n *NodeClaim) Add(pod *corev1.Pod, podData *PodData, nodeClaimRequirements
 	n.Spec.Resources.Requests = resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 	n.Requirements = nodeClaimRequirements
 	n.topology.Register(corev1.LabelHostname, n.hostname)
-	n.topology.Record(pod, n.Spec.Taints, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	deltas := n.topology.Record(pod, n.Spec.Taints, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
 	n.hostPortUsage.Add(pod, scheduling.GetHostPorts(pod))
 	n.reservationManager.Reserve(n.hostname, offeringsToReserve...)
 	n.releaseReservedOfferings(n.reservedOfferings, offeringsToReserve)
 	n.reservedOfferings = offeringsToReserve
+
+	n.recordSchedulingStep(instanceTypes, nodeClaimRequirements, deltas)
 }
 
 // releaseReservedOfferings releases all offerings which are present in the current reserved offerings, but are not

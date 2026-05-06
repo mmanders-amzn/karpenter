@@ -184,4 +184,46 @@ download: ## Recursively "go mod download" on all directories where go.mod exist
 gen_instance_types:
 	go run kwok/tools/gen_instance_types.go > kwok/cloudprovider/instance_types.json
 
-.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test test-memory test-dra e2etest-dra benchmark deflake vulncheck licenses verify download gen_instance_types setup-kind-dra delete-kind-dra apply-with-kind-dra
+RAPID_CHECKS ?= 100
+RAPID_TIMEOUT ?= 30m
+
+test-nodeclaim-optimization: ## Run nodeclaim optimization unit tests
+	KUBEBUILDER_ASSETS="$$(setup-envtest use -p path)" \
+	TEST_OUTPUT_DIR=$$(pwd)/test_output \
+	go test ./pkg/controllers/provisioning/scheduling/ \
+		-run TestScheduling \
+		--ginkgo.focus="NodeClaim Optimization" \
+		--ginkgo.skip="Rapid" \
+		-v -count=1
+
+test-nodeclaim-optimization-rapid: ## Run all nodeclaim optimization rapid tests (RAPID_CHECKS=N, RAPID_TIMEOUT=T to override)
+	KUBEBUILDER_ASSETS="$$(setup-envtest use -p path)" \
+	TEST_OUTPUT_DIR=$$(pwd)/test_output \
+	go test ./pkg/controllers/provisioning/scheduling/ \
+		-run TestScheduling \
+		--ginkgo.focus="NodeClaim Optimization Rapid" \
+		-v -count=1 \
+		-timeout $(RAPID_TIMEOUT) \
+		-rapid.checks=$(RAPID_CHECKS)
+
+test-nodeclaim-optimization-rapid-cost: ## Run rapid cost comparison tests only (RAPID_CHECKS=N, RAPID_TIMEOUT=T to override)
+	KUBEBUILDER_ASSETS="$$(setup-envtest use -p path)" \
+	TEST_OUTPUT_DIR=$$(pwd)/test_output \
+	go test ./pkg/controllers/provisioning/scheduling/ \
+		-run TestScheduling \
+		--ginkgo.focus="should produce equal or lower cost with random workloads" \
+		-v -count=1 \
+		-timeout $(RAPID_TIMEOUT) \
+		-rapid.checks=$(RAPID_CHECKS)
+
+test-nodeclaim-optimization-rapid-diverse: ## Run rapid diverse constraint tests only (RAPID_CHECKS=N, RAPID_TIMEOUT=T to override)
+	KUBEBUILDER_ASSETS="$$(setup-envtest use -p path)" \
+	TEST_OUTPUT_DIR=$$(pwd)/test_output \
+	go test ./pkg/controllers/provisioning/scheduling/ \
+		-run TestScheduling \
+		--ginkgo.focus="should handle diverse" \
+		-v -count=1 \
+		-timeout $(RAPID_TIMEOUT) \
+		-rapid.checks=$(RAPID_CHECKS)
+
+.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test test-memory test-dra e2etest-dra benchmark deflake vulncheck licenses verify download gen_instance_types setup-kind-dra delete-kind-dra apply-with-kind-dra test-nodeclaim-optimization test-nodeclaim-optimization-rapid test-nodeclaim-optimization-rapid-cost test-nodeclaim-optimization-rapid-diverse
